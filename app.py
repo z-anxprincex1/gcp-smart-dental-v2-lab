@@ -6,6 +6,8 @@ import numpy as np
 import pandas as pd
 import tempfile
 from datetime import datetime
+import os
+import joblib
 
 # remove for gcp because it's not required
 # from firebase_admin import firestore, credentials
@@ -20,23 +22,35 @@ app = Flask(__name__)
 CORS(app)
 db = firestore.Client(database="clinic")
 
-model = None
+price_model = None
+timeline_model = None
 
-def load_model():
-    global model
-    if model is not None:
-        return model
+def load_models():
+    global price_model, timeline_model
+    if price_model is not None and timeline_model is not None:
+        return price_model, timeline_model
 
     storage_client = storage.Client()
     bucket = storage_client.bucket("dental-ai-pricing-model")
-    blob = bucket.blob("pricing_model.json")
 
-    tmp = tempfile.NamedTemporaryFile(delete=False)
-    blob.download_to_filename(tmp.name)
+    # load price_model
+    if price_model is None:
+        price_blob = bucket.blob("pricing_model.json")
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            price_blob.download_to_filename(tmp.name)
+            price_model = XGBRegressor()
+            price_model.load_model(tmp.name)
+            os.remove(tmp.name)
 
-    model = XGBRegressor()
-    model.load_model(tmp.name)
-    return model
+    if timeline_model is None:
+        timeline_blob = bucket.blob("timeline_model.json")
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            timeline_blob.download_to_filename(tmp.name)
+            timeline_model = XGBRegressor()
+            timeline_model.load_model(tmp.name)
+            os.remove(tmp.name)
+
+    return price_model, timeline_model
 
 def predict_price(model, labs):
     now = datetime.now()
@@ -87,6 +101,115 @@ def predict_price(model, labs):
 
     return updated_results
 
+def predict_timeline(price_model, timeline_model, labs):
+    now = datetime.now()
+    curr_hour = now.hour
+    curr_day = now.weekday()
+
+    feature_order_timeline = ["lab_type","procedure_type","base_price","dynamic_price","hour_sin","hour_cos","dow_sin","dow_cos"]
+    feature_order_price = [
+        "lab_type", "service_id", "base_price", "hour", "day_of_week",
+        "hour_sin", "hour_cos", "dow_sin", "dow_cos"
+    ]
+
+    updated_results = []
+
+    for lab in labs:
+        services = lab.get("services_available", {})
+
+        for service_id_str, service_info in services.items():
+            base_price = service_info.get("price")
+            if base_price is None:
+                continue
+
+            hour_sin = np.sin(2 * np.pi * curr_hour / 24)
+            hour_cos = np.cos(2 * np.pi * curr_hour / 24)
+            dow_sin  = np.sin(2 * np.pi * curr_day / 7)
+            dow_cos  = np.cos(2 * np.pi * curr_day / 7)
+
+            price_row = {
+                "lab_type": lab.get("type"),
+                "service_id": int(service_id_str),
+                "base_price": float(base_price),
+                "hour": curr_hour,
+                "day_of_week": curr_day,
+                "hour_sin": hour_sin,
+                "hour_cos": hour_cos,
+                "dow_sin": dow_sin,
+                "dow_cos": dow_cos
+            }
+
+            df_row_price = pd.DataFrame([price_row], columns=feature_order_price)
+
+            multiplier = float(price_model.predict(df_row_price)[0])
+            dynamic_price = float(base_price * multiplier)
+
+            service_info["pred_multiplier"] = multiplier
+            service_info["dynamic_price"] = dynamic_price
+            
+            proc_type = service_info.get("type") or int(service_id_str)
+            timeline_row = {
+                "lab_type": lab.get("type"),
+                "procedure_type": proc_type,
+                "base_price": float(base_price),
+                "dynamic_price": dynamic_price,
+                "hour_sin": hour_sin,
+                "hour_cos": hour_cos,
+                "dow_sin": dow_sin,
+                "dow_cos": dow_cos
+            }
+
+            df_row_timeline = pd.DataFrame([timeline_row], columns=feature_order_timeline)
+            predict_tat = float(timeline_model.predict(df_row_timeline)[0])
+            service_info["timeline_tat"] = float(predict_tat)
+        
+        updated_results.append(lab)
+
+    return updated_results
+
+# Suggested function to fetch timeline from ml model
+#
+# def predict_timeline(model, X):
+#     preds = model.predict(X)
+#     timeline = pd.DataFrame({
+#         "index": X.index,
+#         "predicted_tat": preds
+#     }).sort_values("index")
+#     return timeline
+
+@app.route("/search-service-timeline", methods=["GET"])
+def search_service_timeline():
+    lab_type = request.args.get("type", type=int)
+    service_num = request.args.get("service")
+
+    if lab_type is None or service_num is None:
+        return jsonify({
+            "error": "Missing required parameters: type and service"
+        }), 400
+    
+    docs = db.collection("test-lab-data") \
+             .where("type", "==", lab_type) \
+             .stream()
+
+    matching_results = []
+
+    for doc in docs:
+        data = doc.to_dict()
+        services_available = data.get("services_available", {})
+        has_service = str(service_num) in services_available
+
+        if has_service:
+            data["id"] = doc.id
+            matching_results.append(data)
+
+    price_model, timeline_model = load_models()
+    predict_timeline_results = predict_timeline(price_model, timeline_model, matching_results)
+
+    return jsonify({
+        "count": len(predict_timeline_results),
+        "results": predict_timeline_results
+    })
+
 @app.route("/search-service", methods=["GET"])
 def search_service():
 
@@ -113,7 +236,7 @@ def search_service():
             data["id"] = doc.id
             matching_results.append(data)
 
-    model = load_model()
+    model, _ = load_models()
     results_with_predictions = predict_price(model, matching_results)
 
     return jsonify({
